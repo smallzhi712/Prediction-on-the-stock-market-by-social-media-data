@@ -1,0 +1,276 @@
+---
+title: "Final"
+author: "蔡淳如"
+date: "04/08/2019"
+---
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setenv(LANGUAGE = "en")
+options(stringsAsFactors = F)
+library(readxl)
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(glmnet)
+library(nnet)
+library(e1071)
+library(rpart)
+library(randomForest)
+library(caret)
+```
+
+# Load data
+## news
+```{r}
+load("../temp/all_news.rda")
+load("../temp/all_market.rda")
+load("../temp/all_counter.rda")
+```
+## tokens
+```{r}
+load("../temp/tokens.rda")
+```
+
+# Model Function
+## Logistic regression
+```{r}
+logi <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- glmnet(x = train_set %>% select(-newsid, -trend) %>% as.matrix(), y = train_set$trend, family="binomial")
+  predicted_result$predicted_trend <- predict(fit, test_set %>% select(-newsid, -trend) %>% as.matrix(), s = 0.001, "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+}
+```
+## Multinomial regression
+```{r}
+multi <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- multinom(trend ~ ., data = train_set %>% select(-newsid), MaxNWts = 5000)
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+}
+```
+## Naive Bayes
+```{r}
+NB <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- naiveBayes(trend ~ ., data = train_set %>% select(-newsid), probability=TRUE)
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+}
+```
+## SVM
+```{r}
+SVM <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- svm(trend ~ ., data = train_set %>% select(-newsid))
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid))
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+}
+```
+## Decision tree
+```{r}
+DT <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- rpart(trend ~ ., data = train_set %>% select(-newsid), method = "class")
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), type = "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+}
+```
+## Random Forest
+```{r}
+RF <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- randomForest(trend ~ ., data = train_set %>% select(-newsid))
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+}
+```
+
+# Backtest setup
+## Create time list
+```{r}
+time_list <- list("2016-01-01","2016-02-01","2016-03-01","2016-04-01","2016-05-01","2016-06-01","2016-07-01","2016-08-01","2016-09-01","2016-10-01","2016-11-01","2016-12-01","2017-01-01","2017-02-01","2017-03-01","2017-04-01","2017-05-01","2017-06-01","2017-07-01","2017-08-01","2017-09-01","2017-10-01","2017-11-01","2017-12-01","2018-01-01","2018-02-01","2018-03-01","2018-04-01","2018-05-01","2018-06-01","2018-07-01","2018-08-01","2018-09-01","2018-10-01","2018-11-01","2018-12-01","2019-01-01")
+```
+## Select target
+```{r}
+target_stock <- all_market %>%
+  filter(grepl("^2330", symbol)) %>% #TSMC
+  select(date, close)
+target_news <- all_news %>%
+  filter(grepl("台積電", content)|grepl("臺積電",content)) %>%
+  select(date, newsid)
+target_tokens <- target_news %>%
+  left_join(tokens)
+```
+## Set parameters
+```{r}
+n <- 1
+sigma_perc <- 0.2
+key_n <- 100
+```
+
+# Backtest
+```{r include=FALSE}
+predicted_allnews <- data.frame()
+
+for(i in 1:33){
+  backtest_stock <- target_stock %>%
+    filter((date >= as.Date(time_list[[i]])) & (date < as.Date(time_list[[i+4]])))
+  backtest_news <- target_news %>%
+    filter((date >= as.Date(time_list[[i]])) & (date < as.Date(time_list[[i+4]])))
+  backtest_tokens <- target_news %>%
+    left_join(tokens) %>%
+    filter((date >= as.Date(time_list[[i]])) & (date < as.Date(time_list[[i+4]])))
+  
+  stock_fluc <- backtest_stock %>%
+    mutate(fluc = (close/lag(close) - n))
+
+  up_fluc <- stock_fluc %>% arrange(desc(fluc)) %>% select(fluc) %>%
+    slice(round(nrow(backtest_stock)*sigma_perc,0):round(nrow(backtest_stock)*sigma_perc,0))
+  down_fluc <- stock_fluc %>% arrange(fluc) %>% select(fluc) %>%
+    slice(round(nrow(backtest_stock)*sigma_perc,0):round(nrow(backtest_stock)*sigma_perc,0))
+  
+  up_sigma <- 0.001 #上漲幅度
+    #up_fluc[[1]] 
+  down_sigma <- -0.001 #下跌幅度
+    #down_fluc[[1]]
+  
+  stock_trend <- stock_fluc %>%
+    mutate(trend = ifelse(fluc > up_sigma, 1, ifelse(fluc < down_sigma, -1, 0))) %>%
+    mutate(trend = lead(trend, n)) %>%
+    select(-fluc) %>%
+    drop_na()
+  
+  news_label <- stock_trend %>% select(date, trend) %>%
+    inner_join(backtest_news) %>% filter(trend != 0) %>% mutate(trend = as.factor(trend))
+
+  up_news <- news_label %>%
+    filter(trend == 1) %>%
+    left_join(backtest_tokens)
+  down_news <- news_label %>%
+    filter(trend == -1) %>%
+    left_join(backtest_tokens)
+  
+  backtest_up <- up_news %>%
+    filter((date >= as.Date(time_list[[i]])) & (date < as.Date(time_list[[i+3]])))
+  backtest_down <- down_news %>%
+    filter((date >= as.Date(time_list[[i]])) & (date < as.Date(time_list[[i+3]])))
+
+  up_tfidf <- backtest_up %>%
+    count(word) %>% rename(tf = n) %>%
+    left_join(up_news %>% group_by(word) %>% summarise(df = n_distinct(newsid))) %>%
+    mutate(tfidf = (1+log(tf)) * log(n_distinct(up_news$newsid)/df)) %>%
+    left_join(backtest_tokens %>% group_by(word) %>% summarise(all_df = n_distinct(newsid)))%>%
+    mutate(df_allidf = (1+log(df)) * log(n_distinct(backtest_tokens$newsid)/all_df))
+  down_tfidf <- backtest_down %>%
+    count(word) %>% rename(tf = n) %>%
+    left_join(down_news %>% group_by(word) %>% summarise(df = n_distinct(newsid)))%>%
+    mutate(tfidf = (1+log(tf)) * log(n_distinct(down_news$newsid)/df)) %>%
+    left_join(backtest_tokens %>% group_by(word) %>% summarise(all_df = n_distinct(newsid)))%>%
+    mutate(df_allidf = (1+log(df)) * log(n_distinct(backtest_tokens$newsid)/all_df))
+
+  up_key <- up_tfidf %>%
+    select(word, df_allidf) %>% arrange(desc(df_allidf)) %>%
+    slice(1:key_n)
+  down_key <- down_tfidf %>%
+    select(word, df_allidf) %>% arrange(desc(df_allidf)) %>%
+    slice(1:key_n)
+  all_key <- up_key %>% bind_rows(down_key)
+  
+  f1 <- backtest_tokens %>% filter(word %in% all_key$word) %>% count(newsid,word)
+  dtm1 <- f1 %>% cast_dtm(document = newsid, term = word, value = n)
+  mat1 <- as.matrix(dtm1) %>% as_tibble() %>%
+    bind_cols(newsid = dtm1$dimnames$Docs) %>%
+    mutate(newsid = as.integer(newsid)) %>%
+    left_join(news_label %>% select(newsid), by = "newsid") %>%
+    select(newsid, everything())
+  colnames(mat1) <- make.names(colnames(mat1))
+
+  train <- mat1 %>%
+    left_join(news_label %>%
+                filter((date >= as.Date(time_list[[i]])) & (date < as.Date(time_list[[i+3]]))) %>%
+                select(trend, newsid), by = "newsid") %>% na.omit()
+  test <- mat1 %>%
+    left_join(news_label %>%
+                filter((date >= as.Date(time_list[[i+3]])) & (date < as.Date(time_list[[i+4]]))) %>%
+                select(trend, newsid), by = "newsid") %>% na.omit()
+
+  model <- #logi(train, test)
+    #multi(train, test)
+    #NB(train, test)
+    SVM(train, test)
+    #DT(train, test)
+    #RF(train, test)
+  
+  predicted_news <-model %>%
+    left_join(all_news %>% select(date, newsid)) %>%
+    group_by(date, predicted_trend) %>%
+    count() %>%
+    spread(key = predicted_trend, value = n) %>%
+    mutate(`-1` = replace_na(`-1`, 0), `1` = replace_na(`1`, 0)) %>%
+    rename("up" = `1`, "down" = `-1`) %>%
+    ungroup()
+
+  predicted_allnews <- predicted_allnews %>% bind_rows(predicted_news)
+}
+
+```
+
+# Result
+## Backtest predict
+```{r}
+weight <- 0 #加入之前新聞之權重
+news_numdiff <- 0.1 #出手門檻
+
+actual_trend <- target_stock %>%
+  mutate(fluc = (close/lag(close) - n)) %>%
+  mutate(trend = ifelse(fluc > up_sigma, 1, ifelse(fluc < down_sigma, -1, 0))) %>%
+  mutate(trend = lead(trend, n)) %>%
+  select(-fluc, -close) %>%
+  filter((date >= as.Date(time_list[[4]])) & (date < as.Date(time_list[[37]]))) %>%
+  drop_na()
+
+weight_allnews <- actual_trend %>%
+  select(date, trend) %>%
+  left_join(predicted_allnews, by = "date") %>%
+  mutate(down = replace_na(down, 0), up = replace_na(up, 0))
+
+weight_allnews$all_up <- NA
+weight_allnews$all_down <- NA
+
+for(i in 1:nrow(weight_allnews)){
+  if(i==1){
+    weight_allnews$all_up[i] = weight_allnews$up[i]
+    weight_allnews$all_down[i] = weight_allnews$down[i]
+  }else{
+    weight_allnews$all_up[i] = weight_allnews$all_up[i-1]*weight + weight_allnews$up[i]
+    weight_allnews$all_down[i] = weight_allnews$all_down[i-1]*weight + weight_allnews$down[i]
+  }
+}
+
+backtest_predict <- weight_allnews %>%
+  mutate(news_diff = (all_up - all_down)/(all_up + all_down)) %>%
+  mutate(predicted_day = ifelse(news_diff > news_numdiff, 1, ifelse(news_diff < -news_numdiff, -1, 0)))
+backtest_predict[is.na(backtest_predict)] <- 0
+```
+## Execution
+```{r}
+execute_table <- backtest_predict %>% select(date, predicted_day, trend)
+execute_rate <- nrow(execute_table %>% filter(predicted_day != 0))/nrow(execute_table) *100
+
+execute_rate
+```
+## Confusion Matrix
+```{r}
+confusion <- table((backtest_predict %>% filter(predicted_day != 0, trend != 0))$predicted_day, (backtest_predict %>% filter(predicted_day != 0, trend != 0))$trend, dnn = c("Predicted", "Actual"))
+
+confusion
+```
+## Precision
+```{r}
+precision <- sum(diag(confusion))/sum(confusion) * 100
+
+precision
+```

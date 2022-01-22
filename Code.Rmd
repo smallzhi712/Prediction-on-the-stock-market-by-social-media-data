@@ -1,0 +1,405 @@
+---
+title: "Final"
+author: "蔡淳如"
+date: "04/08/2019"
+---
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setenv(LANGUAGE = "en")
+options(stringsAsFactors = F)
+library(readxl)
+library(jiebaR)
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(glmnet)
+library(nnet)
+library(e1071)
+library(rpart)
+library(randomForest)
+library(caret)
+```
+
+# Data Pre-processing
+## Read
+```{r eval=FALSE, include=FALSE}
+bbs_raw <- read.csv("../bda2020_dataset/bbs.csv")
+forum_raw <- read.csv("../bda2020_dataset/forum.csv")
+news_raw <- read.csv("../bda2020_dataset/news.csv")
+
+market2018_raw <- read_excel("../bda2020_dataset/stock_data.xlsx", sheet = 2)
+market2017_raw <- read_excel("../bda2020_dataset/stock_data.xlsx", sheet = 3)
+market2016_raw <- read_excel("../bda2020_dataset/stock_data.xlsx", sheet = 4)
+counter2018_raw <- read_excel("../bda2020_dataset/stock_data.xlsx", sheet = 2)
+counter2017_raw <- read_excel("../bda2020_dataset/stock_data.xlsx", sheet = 3)
+counter2016_raw <- read_excel("../bda2020_dataset/stock_data.xlsx", sheet = 4)
+
+```
+## Tidy
+```{r eval=FALSE, include=FALSE}
+bbs <- bbs_raw %>% select(s_name, post_time, title, content) %>%
+  filter(str_detect(title, pattern = fixed("[公告]")) == F)
+forum <- forum_raw %>% select(s_name, post_time, title, content)
+news <- news_raw %>% select(author, post_time, title, content) %>% rename(s_name = author)
+```
+## Bind
+```{r eval=FALSE, include=FALSE}
+all_news <- bbs %>%
+  bind_rows(forum) %>%
+  bind_rows(news) %>%
+  filter(!(content %in% c(""))) %>%
+  mutate(date = str_sub(post_time, 1, -10)) %>%
+  mutate(date = lubridate::ymd(date)) %>%
+  arrange(date) %>%
+  mutate(newsid = row_number()) %>%
+  select(date, newsid, content) %>%
+  na.omit()
+
+all_market <- market2016_raw %>%
+  bind_rows(market2017_raw) %>%
+  bind_rows(market2018_raw) %>%
+  rename(date = 年月日) %>%
+  mutate(date = lubridate::ymd(date)) %>%
+  arrange(date)
+colnames(all_market) <- c("symbol", "date", "open", "highest", "lowest", "close", "turnover_volumn", "turnover_value", "turnover_num", "outstanding", "PE", "PB")
+
+all_counter <- counter2016_raw %>%
+  bind_rows(counter2017_raw) %>%
+  bind_rows(counter2018_raw) %>%
+  rename(date = 年月日) %>%
+  mutate(date = lubridate::ymd(date)) %>%
+  arrange(date)
+colnames(all_counter) <- c("symbol", "date", "open", "highest", "lowest", "close", "turnover_volumn", "turnover_value", "turnover_num", "outstanding", "PE", "PB")
+```
+
+## Save
+```{r eval=FALSE, include=FALSE}
+save(all_news, file = "../temp/all_news.rda")
+save(all_market, file = "../temp/all_market.rda")
+save(all_counter, file = "../temp/all_counter.rda")
+```
+
+## Load
+```{r}
+load("../temp/all_news.rda")
+load("../temp/all_market.rda")
+load("../temp/all_counter.rda")
+```
+
+# Tokenization
+## Cutter
+```{r eval=FALSE, include=FALSE}
+cutter <- worker()
+stopWords <- readRDS("../temp/stopWords.rds")
+```
+## Unnest
+```{r eval=FALSE, include=FALSE}
+tokens <- all_news %>%
+  select(newsid, content) %>%
+  mutate(word = purrr::map(content, function(x)segment(x, cutter))) %>%
+  unnest(word) %>%
+  filter(!(word %in% stopWords$word)) %>%
+  filter(!str_detect(word, "[a-zA-Z0-9]+")) %>%
+  filter((nchar(word) >= 2) & (nchar(word) <= 6)) %>%
+  select(-content) %>%
+  arrange(newsid)
+```
+## Save
+```{r eval=FALSE, include=FALSE}
+save(tokens, file = "../temp/tokens.rda")
+```
+## Load
+```{r}
+load("../temp/tokens.rda")
+```
+# Sentiment corpus
+## Load
+```{r}
+load("../temp/lexicon.rda")
+```
+
+# Model Function
+## Logistic regression
+```{r}
+logi <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- glmnet(x = train_set %>% select(-newsid, -trend) %>% as.matrix(), y = train_set$trend, family="binomial")
+  predicted_result$predicted_trend <- predict(fit, test_set %>% select(-newsid, -trend) %>% as.matrix(), s = 0.001, "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+  return(predicted_result)
+}
+```
+## Multinomial regression
+```{r}
+multi <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- multinom(trend ~ ., data = train_set %>% select(-newsid), MaxNWts = 5000)
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+  return(predicted_result)
+}
+```
+## Naive Bayes
+```{r}
+NB <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- naiveBayes(trend ~ ., data = train_set %>% select(-newsid), probability=TRUE)
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+  return(predicted_result)
+}
+```
+## SVM
+```{r}
+SVM <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- svm(trend ~ ., data = train_set %>% select(-newsid))
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid))
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+  return(predicted_result)
+}
+```
+## Decision tree
+```{r}
+DT <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- rpart(trend ~ ., data = train_set %>% select(-newsid), method = "class")
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), type = "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+  return(predicted_result)
+}
+```
+## Random Forest
+```{r}
+RF <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- randomForest(trend ~ ., data = train_set %>% select(-newsid))
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+  return(predicted_result)
+}
+```
+
+```{r eval=FALSE, include=FALSE}
+KNN <- function(train_set, test_set){
+  predicted_result <- test_set %>% select(newsid)
+  fit <- knn3(trend ~ ., data = train_set %>% select(-newsid), k=5, prob = T)
+  predicted_result$predicted_trend <- predict(fit, newdata = test_set %>% select(-newsid), type = "class")
+  predicted_result <- predicted_result %>% left_join(test_set %>% select(newsid, trend), by = "newsid")
+  return(predicted_result)
+}
+```
+
+# Result Function
+## Confusion Matrix
+```{r}
+conf <- function(predicted_result){
+  table(predicted_result$predicted_trend, predicted_result$trend, dnn = c("Predicted", "Actual"))
+}
+```
+## Precision
+```{r}
+prec <- function(confusion){
+  sum(diag(confusion))/sum(confusion) * 100
+}
+```
+
+# Target 選標的股
+## Select
+```{r}
+target_stock <- all_market %>%
+  filter(grepl("^2330", symbol)) %>% #TSMC
+  #filter(grepl("^2327", symbol)) %>% #國巨
+  #filter(grepl("^2409", symbol)) %>% #AUO友達
+  #filter(grepl("^2454", symbol)) %>% #聯發科
+  select(date, close)
+#標的股資料
+
+target_news <- all_news %>%
+  filter(grepl("台積電", content)|grepl("臺積電",content)) %>%
+  #filter(grepl("國巨", content)) %>%
+  #filter(grepl("友達", content)) %>%
+  #filter(grepl("聯發科", content)) %>%
+  select(date, newsid)
+#標的股相關新聞
+```
+## Bind target tokens
+```{r}
+target_tokens <- target_news %>%
+  left_join(tokens)
+```
+## Parameters 參數調整
+```{r}
+n <- 1 #股價與前n日相比
+sigma_perc <- 0.1 #漲跌日與交易日之比例
+
+stock_fluc <- target_stock %>%
+  mutate(fluc = (close/lag(close) - n))
+
+up_fluc <- stock_fluc %>% arrange(desc(fluc)) %>% select(fluc) %>% slice(round(nrow(target_stock)*sigma_perc,0):round(nrow(target_stock)*sigma_perc,0))
+#使上漲幅度維持在上漲日數為交易日*sigma_perc
+
+down_fluc <- stock_fluc %>% arrange(fluc) %>% select(fluc) %>% slice(round(nrow(target_stock)*sigma_perc,0):round(nrow(target_stock)*sigma_perc,0))
+#使下跌幅度維持在上漲日數為交易日*sigma_perc
+
+up_sigma <- #up_fluc[[1]]
+  0.001
+#上漲之幅度(可選擇為固定或浮動)
+down_sigma <- #down_fluc[[1]]
+  -0.001
+#下跌之幅度(可選擇為固定或浮動)
+
+stock_trend <- stock_fluc %>%
+  mutate(trend = ifelse(fluc > up_sigma, 1, ifelse(fluc < down_sigma, -1, 0))) %>%
+  mutate(trend = lead(trend, n)) %>%
+  select(-fluc) %>%
+  drop_na()
+#上漲為1、下跌為-1、持平為0
+
+stock_trend %>% group_by(trend) %>% count()
+#上漲、下跌、持平之交易日數
+```
+## Label
+```{r}
+news_label <- stock_trend %>% select(date, trend) %>% inner_join(target_news) %>% filter(trend != 0) %>% mutate(trend = as.factor(trend))
+
+up_news <- news_label %>%
+  filter(trend == 1) %>%
+  left_join(target_tokens)
+
+down_news <- news_label %>%
+  filter(trend == -1) %>%
+  left_join(target_tokens)
+```
+
+# Observe data
+## Count news
+```{r}
+nrow(target_news) #相關新聞篇數
+n_distinct(up_news$newsid) #上漲新聞篇數
+n_distinct(down_news$newsid) #下跌新聞篇數
+```
+## Plot trend 趨勢圖
+```{r}
+ggplot(target_stock, aes(date, close)) +
+  geom_line()
+```
+
+# Keyword 選關鍵字
+## TF-IDF -> DF-allIDF
+```{r}
+up_tfidf <- up_news %>%
+  count(word) %>% rename(tf = n) %>%
+  left_join(up_news %>% group_by(word) %>% summarise(df = n_distinct(newsid))) %>%
+  mutate(tfidf = (1+log(tf)) * log(n_distinct(up_news$newsid)/df)) %>%
+  left_join(target_tokens %>% group_by(word) %>% summarise(all_df = n_distinct(newsid)))%>%
+  mutate(df_allidf = (1+log(df)) * log(n_distinct(target_tokens$newsid)/all_df))
+
+down_tfidf <- down_news %>%
+  count(word) %>% rename(tf = n) %>%
+  left_join(down_news %>% group_by(word) %>% summarise(df = n_distinct(newsid)))%>%
+  mutate(tfidf = (1+log(tf)) * log(n_distinct(down_news$newsid)/df)) %>%
+  left_join(target_tokens %>% group_by(word) %>% summarise(all_df = n_distinct(newsid)))%>%
+  mutate(df_allidf = (1+log(df)) * log(n_distinct(target_tokens$newsid)/all_df))
+```
+## Select key
+```{r}
+key_n <- 100 #選擇關鍵字數
+
+up_key <- up_tfidf %>%
+  select(word, df_allidf) %>% arrange(desc(df_allidf)) %>%
+  slice(1:key_n)
+down_key <- down_tfidf %>%
+  select(word, df_allidf) %>% arrange(desc(df_allidf)) %>%
+  slice(1:key_n)
+
+all_key <- up_key %>% bind_rows(down_key)
+```
+## Save key
+```{r}
+#write.csv(up_key, "../output/up_key.csv", row.names = FALSE)
+#write.csv(down_key, "../output/down_key.csv", row.names = FALSE)
+```
+
+# Feature
+## Feature 1: Keywords
+```{r}
+f1 <- target_tokens %>% filter(word %in% all_key$word) %>% count(newsid,word)
+
+dtm1 <- f1 %>% cast_dtm(document = newsid, term = word, value = n)
+
+mat1 <- as.matrix(dtm1) %>% as_tibble() %>%
+  bind_cols(newsid = dtm1$dimnames$Docs) %>%
+  mutate(newsid = as.integer(newsid)) %>%
+  select(newsid, everything())
+
+colnames(mat1) <- make.names(colnames(mat1))
+```
+## Feature 2: sentiment corpus 股票漲跌相關字詞
+```{r eval=FALSE, include=FALSE}
+f2 <- target_tokens %>%
+  filter(word %in% lexicon$words) %>%
+  count(newsid, word)
+
+dtm2 <- f2 %>% cast_dtm(document = newsid, term = word, value = n)
+
+mat2 <- as.matrix(dtm2) %>% as_tibble() %>%
+  bind_cols(newsid = dtm2$dimnames$Docs) %>%
+  mutate(newsid = as.integer(newsid)) %>%
+  left_join(news_label %>% select(newsid), by = "newsid") %>%
+  select(newsid, everything())
+  
+colnames(mat2) <- make.names(colnames(mat2))
+```
+
+# Train & Test set
+## Select features
+```{r}
+mat <- mat1 %>% #feature 1: keywords
+  #full_join(mat2, by = "newsid") %>% #feature 2: sentiment corpus
+  left_join(news_label %>% select(trend, newsid), by = "newsid") %>%
+  na.omit()
+```
+## Divide
+```{r}
+index <- sample(1:nrow(mat), ceiling(nrow(mat) * .80))
+
+train <- mat[index,]
+test <- mat[-index,]
+```
+
+# Result
+## Confusion Matrix
+```{r include=FALSE}
+#logi_conf <- conf(logi(train, test))
+#multi_conf <- conf(multi(train, test))
+#NB_conf <- conf(NB(train, test))
+SVM_conf <- conf(SVM(train, test))
+#DT_conf <- conf(DT(train, test))
+#RF_conf <- conf(RF(train, test))
+```
+
+```{r include=FALSE}
+#logi_conf
+#multi_conf
+#NB_conf
+SVM_conf
+#DT_conf
+#RF_conf
+```
+## Precision
+```{r}
+#logi_prec <- 
+  #prec(logi_conf)
+#multi_prec <- 
+  #prec(multi_conf)
+#NB_prec <- 
+  #prec(NB_conf)
+#SVM_prec <- 
+  prec(SVM_conf)
+#DT_prec <- 
+  #prec(DT_conf)
+#RF_prec <- 
+  #prec(RF_conf)
+```
